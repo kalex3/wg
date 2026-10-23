@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          # DL3018: apk package versions are tracked via the pinned Alpine release.
+          ignore: DL3018
+
+      - name: ShellCheck
+        run: shellcheck entrypoint healthcheck resolvconf scripts/smoke-test.sh
+
+      - name: Validate compose file
+        run: docker compose config --quiet
+
+  smoke-test:
+    runs-on: ubuntu-latest
+    needs: lint
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run tunnel smoke test
+        run: ./scripts/smoke-test.sh

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Healthy if at least one peer had a handshake within WG_HANDSHAKE_MAX_AGE
+# seconds (default 180, i.e. WireGuard's reject-after-time window).
+set -eu
+
+IFACE="${WG_INTERFACE:-wg0}"
+MAX_AGE="${WG_HANDSHAKE_MAX_AGE:-180}"
+
+wg show "$IFACE" latest-handshakes 2>/dev/null |
+    awk -v now="$(date +%s)" -v max="$MAX_AGE" \
+        '$2 > 0 && now - $2 >= 0 && now - $2 < max { ok = 1 } END { exit !ok }'

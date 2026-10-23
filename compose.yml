@@ -1,0 +1,54 @@
+services:
+  wg:
+    build: .
+    image: wg:latest
+    restart: unless-stopped
+    init: true
+    # Not read-only: with a `DNS =` line in the config, wg-quick (via our
+    # resolvconf shim) has to write /etc/resolv.conf, which Podman mounts ro
+    # on read-only containers. If your config has no DNS =, you can enable:
+    # read_only: true
+    tmpfs:
+      - /run
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    sysctls:
+      # Only used by wg-quick for full-tunnel configs (AllowedIPs = 0.0.0.0/0).
+      - net.ipv4.conf.all.src_valid_mark=1
+    pids_limit: 128
+    mem_limit: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    volumes:
+      - ${WG_CONFIG:-./wg0.conf}:/etc/wireguard/wg0.conf:ro
+
+  # Example workload: shares wg's network namespace, so every packet it sends
+  # leaves through the tunnel (or, if the config is not a full tunnel, only
+  # traffic matching the peers' AllowedIPs does; see wg0.conf.example).
+  # Replace the image/command with your own service and publish any ports on
+  # the `wg` service instead, since network settings belong to that container.
+  client:
+    image: alpine:3.22
+    network_mode: service:wg
+    depends_on:
+      wg:
+        condition: service_healthy
+        # Recreate the client when wg restarts, otherwise it keeps a stale netns.
+        restart: true
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW # only needed for ping
+    security_opt:
+      - no-new-privileges:true
+    command: ["sleep", "infinity"]

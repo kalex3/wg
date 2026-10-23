@@ -1,0 +1,27 @@
+#!/bin/sh
+# Minimal resolvconf shim for wg-quick's DNS= handling.
+#   resolvconf -a <iface> ...   read resolv.conf content on stdin, install it
+#   resolvconf -d <iface> ...   restore the original resolv.conf
+# /etc/resolv.conf is a bind mount inside containers, so it must be
+# overwritten in place (mv/rename fails with EBUSY).
+set -eu
+
+RESOLV=/etc/resolv.conf
+BAK=/run/resolv.conf.bak
+
+case "${1:-}" in
+    -a)
+        [ -f "$BAK" ] || cp "$RESOLV" "$BAK"
+        cat >"$RESOLV"
+        ;;
+    -d)
+        if [ -f "$BAK" ]; then
+            cat "$BAK" >"$RESOLV"
+            rm -f "$BAK"
+        fi
+        ;;
+    *)
+        echo "usage: resolvconf -a|-d <iface>" >&2
+        exit 1
+        ;;
+esac
