@@ -27,6 +27,14 @@ services:
         max-file: "3"
     volumes:
       - ${WG_CONFIG:-./wg0.conf}:/etc/wireguard/wg0.conf:ro
+    # Defined here as well, because Podman drops the image's HEALTHCHECK for
+    # OCI-format images (e.g. when pulled from GHCR).
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
 
   # Example workload: shares wg's network namespace, so every packet it sends
   # leaves through the tunnel (or, if the config is not a full tunnel, only
