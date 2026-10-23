@@ -1,7 +1,6 @@
 services:
   wg:
-    build: .
-    image: wg:latest
+    image: ghcr.io/kalex3/wg:latest
     restart: unless-stopped
     init: true
     # Not read-only: with a `DNS =` line in the config, wg-quick (via our
