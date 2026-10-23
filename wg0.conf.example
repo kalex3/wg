@@ -1,0 +1,27 @@
+[Interface]
+# Generate with: wg genkey | tee private.key | wg pubkey
+PrivateKey = <this-host-private-key>
+Address = 10.67.2.1/32
+# DNS = 10.67.0.1
+
+# Hub / gateway peer reachable via a DNS name; the entrypoint re-resolves the
+# name whenever the handshake goes stale.
+[Peer]
+PublicKey = <hub-public-key>
+AllowedIPs = 10.67.0.0/24
+Endpoint = vpn.example.com:51820
+PersistentKeepalive = 25
+
+# Directly connected peer.
+[Peer]
+PublicKey = <peer-public-key>
+AllowedIPs = 10.67.0.2/32
+Endpoint = 203.0.113.10:51820
+PersistentKeepalive = 25
+
+# To force ALL traffic of containers using `network_mode: service:wg` through
+# the tunnel, use a full-tunnel peer instead (and drop the narrower ones):
+#   AllowedIPs = 0.0.0.0/0
+# Optional kill switch (block anything that would bypass the tunnel):
+#   PostUp   = iptables -I OUTPUT ! -o %i -m mark ! --mark $(wg show %i fwmark) -m addrtype ! --dst-type LOCAL -j REJECT
+#   PreDown  = iptables -D OUTPUT ! -o %i -m mark ! --mark $(wg show %i fwmark) -m addrtype ! --dst-type LOCAL -j REJECT

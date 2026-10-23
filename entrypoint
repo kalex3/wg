@@ -1,0 +1,53 @@
+#!/bin/sh
+# Brings up the WireGuard interface, then runs the given command
+# (default: idle until stopped).
+#
+# Env:
+#   WG_INTERFACE            interface / config name (default: wg0)
+#   WG_RERESOLVE_INTERVAL   seconds between endpoint re-resolution checks
+#                           for stale peers, 0 disables (default: 30)
+set -eu
+
+IFACE="${WG_INTERFACE:-wg0}"
+CONF="/etc/wireguard/$IFACE.conf"
+INTERVAL="${WG_RERESOLVE_INTERVAL:-30}"
+
+# Re-apply the configured Endpoint for peers without a recent handshake, so
+# DNS names (e.g. DDNS) are resolved again after the remote IP changes.
+reresolve() {
+    while sleep "$INTERVAL"; do
+        wg show "$IFACE" latest-handshakes 2>/dev/null | while read -r pk hs; do
+            [ $(( $(date +%s) - hs )) -gt 135 ] || continue
+            ep=$(awk -v pk="$pk" '
+                { k=$0; sub(/[ \t]*=.*/, "", k)
+                  v=$0; sub(/^[^=]*=[ \t]*/, "", v); sub(/[ \t\r]+$/, "", v) }
+                k == "PublicKey" { cur = v }
+                k == "Endpoint" && cur == pk { print v; exit }
+            ' "$CONF")
+            if [ -n "$ep" ]; then
+                wg set "$IFACE" peer "$pk" endpoint "$ep" || true
+            fi
+        done
+    done
+}
+
+wg-quick up "$IFACE"
+
+if [ "$INTERVAL" -gt 0 ]; then
+    reresolve &
+fi
+
+if [ "$#" -gt 0 ]; then
+    exec "$@"
+fi
+
+# No command given: idle, but tear the tunnel down cleanly on stop.
+sleep infinity &
+sleep_pid=$!
+cleanup() {
+    kill "$sleep_pid" 2>/dev/null || true
+    wg-quick down "$IFACE" || true
+    exit 0
+}
+trap cleanup TERM INT
+wait "$sleep_pid"
