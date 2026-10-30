@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Hadolint
-        uses: hadolint/hadolint-action@v3.1.0
+        uses: hadolint/hadolint-action@v3.5.0
         with:
           dockerfile: Dockerfile
           # DL3018: apk package versions are tracked via the pinned Alpine release.
