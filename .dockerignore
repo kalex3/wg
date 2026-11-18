@@ -1,4 +1,3 @@
 *
 !entrypoint
-!resolvconf
 !healthcheck

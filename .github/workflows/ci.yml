@@ -28,7 +28,7 @@ jobs:
           ignore: DL3018
 
       - name: ShellCheck
-        run: shellcheck entrypoint healthcheck resolvconf
+        run: shellcheck entrypoint healthcheck
 
       - name: Validate compose file
         run: docker compose config --quiet

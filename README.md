@@ -16,7 +16,7 @@ docker compose up -d --build
 - Traffic is only forced through the tunnel for destinations covered by the peers' `AllowedIPs`. Use `AllowedIPs = 0.0.0.0/0` (and optionally the kill switch in `wg0.conf.example`) to force everything.
 - With rootful Docker and `cap_drop: ALL`, the container's root cannot read a
   `600` config owned by another uid. Use `sudo chown root:root wg0.conf`.
-- Shell as the unprivileged user: `docker compose exec -u user -w /home/user wg sh`.
+- Shell as an unprivileged user: `docker compose exec -u nobody wg sh`.
 
 ## Example: Cloudflare WARP with wgcf
 

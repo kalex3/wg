@@ -1,6 +1,11 @@
 #!/bin/sh
-# Brings up the WireGuard interface, then runs the given command
-# (default: idle until stopped).
+# Brings up the WireGuard interface from a wg-quick style config using only
+# busybox sh, wg, ip and iptables, then runs the given command (default: idle
+# until stopped).
+#
+# Besides what `wg addconf` reads, these [Interface] keys are handled here:
+# Address, DNS, MTU, Table, PreUp, PostUp, PreDown, PostDown (hooks run with
+# sh; %i expands to the interface name). SaveConfig is rejected.
 #
 # Env:
 #   WG_INTERFACE            interface / config name (default: wg0)
@@ -11,6 +16,271 @@ set -eu
 IFACE="${WG_INTERFACE:-wg0}"
 CONF="/etc/wireguard/$IFACE.conf"
 INTERVAL="${WG_RERESOLVE_INTERVAL:-30}"
+RESOLV=/etc/resolv.conf
+RESOLV_BAK=/run/resolv.conf.bak
+TAB=$(printf '\t')
+NL='
+'
+
+ADDRESSES='' DNS='' DNS_SEARCH='' MTU='' TABLE=''
+PRE_UP='' POST_UP='' PRE_DOWN='' POST_DOWN=''
+HAVE_DNS=0 FW_PROTOS='' RULE_PROTOS='' FWMARK=''
+
+die() {
+    echo "entrypoint: $*" >&2
+    exit 1
+}
+
+cmd() {
+    echo "[#] $*" >&2
+    "$@"
+}
+
+case $IFACE in
+    '' | *[!a-zA-Z0-9_=+.-]*) die "invalid WG_INTERFACE '$IFACE'" ;;
+esac
+[ "${#IFACE}" -le 15 ] || die "WG_INTERFACE '$IFACE' is longer than 15 characters"
+[ -r "$CONF" ] || die "cannot read $CONF"
+
+# mode=set:  print "key<TAB>value" for the wg-quick-only keys.
+# mode=conf: print the rest, which is what `wg addconf` understands.
+# Keys are case-insensitive and values may carry trailing "# comments", except
+# for hooks, which keep everything after the first "=".
+# shellcheck disable=SC2016 # awk program, nothing should expand
+PARSE_AWK='
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+{
+    line = $0
+    s = line; sub(/#.*/, "", s)
+    eq = index(s, "=")
+    k = tolower(trim(eq ? substr(s, 1, eq - 1) : s))
+    if (substr(k, 1, 1) == "[") iface = (k == "[interface]")
+    if (iface && k ~ /^(address|mtu|dns|table|saveconfig|preup|postup|predown|postdown)$/) {
+        if (mode == "set") {
+            if (k ~ /^pre|^post/) val = trim(substr(line, index(line, "=") + 1))
+            else val = trim(substr(s, eq + 1))
+            print k "\t" val
+        }
+        next
+    }
+    if (mode == "conf") print line
+}'
+
+split_list() {
+    printf '%s' "$1" | tr ',' ' '
+}
+
+load_config() {
+    settings=$(awk -v mode=set "$PARSE_AWK" "$CONF")
+    while IFS=$TAB read -r key value; do
+        case $key in
+            address) ADDRESSES="$ADDRESSES $(split_list "$value")" ;;
+            mtu) MTU=$value ;;
+            table) TABLE=$value ;;
+            saveconfig) [ "$value" != true ] || die "SaveConfig is not supported" ;;
+            preup) PRE_UP="$PRE_UP${PRE_UP:+$NL}$value" ;;
+            postup) POST_UP="$POST_UP${POST_UP:+$NL}$value" ;;
+            predown) PRE_DOWN="$PRE_DOWN${PRE_DOWN:+$NL}$value" ;;
+            postdown) POST_DOWN="$POST_DOWN${POST_DOWN:+$NL}$value" ;;
+            dns)
+                for v in $(split_list "$value"); do
+                    case $v in
+                        *[!0-9.]*)
+                            case $v in
+                                *:*) DNS="$DNS $v" ;;
+                                *) DNS_SEARCH="$DNS_SEARCH $v" ;;
+                            esac
+                            ;;
+                        *) DNS="$DNS $v" ;;
+                    esac
+                done
+                ;;
+        esac
+    done <<EOF
+$settings
+EOF
+}
+
+run_hooks() {
+    [ -n "$1" ] || return 0
+    while IFS= read -r hook; do
+        hook=$(printf '%s' "$hook" | sed "s/%i/$IFACE/g")
+        echo "[#] $hook" >&2
+        (eval "$hook")
+    done <<EOF
+$1
+EOF
+}
+
+# Prints the MTU of the device a `ip route` line points at, preferring an
+# explicit "mtu" in the route itself.
+route_mtu() {
+    m=$(printf '%s\n' "$1" | sed -n 's/.*[[:space:]]mtu \([0-9][0-9]*\).*/\1/p' | head -n 1)
+    if [ -z "$m" ]; then
+        d=$(printf '%s\n' "$1" | sed -n 's/.*[[:space:]]dev \([^[:space:]]*\).*/\1/p' | head -n 1)
+        if [ -n "$d" ]; then
+            m=$(ip link show dev "$d" | sed -n 's/.*[[:space:]]mtu \([0-9][0-9]*\).*/\1/p' | head -n 1)
+        fi
+    fi
+    echo "$m"
+}
+
+# Without MTU=, use the smallest MTU on the paths to the peers' endpoints
+# (falling back to the default route) minus 80 bytes of WireGuard overhead.
+set_mtu_up() {
+    if [ -n "$MTU" ]; then
+        cmd ip link set mtu "$MTU" up dev "$IFACE"
+        return
+    fi
+    best=2147483647
+    for host in $(wg show "$IFACE" endpoints | awk '{ print $2 }'); do
+        [ "$host" != '(none)' ] || continue
+        host=${host%:*}
+        host=${host#\[}
+        host=${host%\]}
+        m=$(route_mtu "$(ip route get "$host" 2>/dev/null || true)")
+        if [ -n "$m" ] && [ "$m" -lt "$best" ]; then best=$m; fi
+    done
+    if [ "$best" -eq 2147483647 ]; then
+        m=$(route_mtu "$(ip route show default 2>/dev/null | head -n 1)")
+        if [ -n "$m" ] && [ "$m" -lt "$best" ]; then best=$m; fi
+    fi
+    if [ "$best" -le 0 ] || [ "$best" -eq 2147483647 ]; then best=1500; fi
+    cmd ip link set mtu $((best - 80)) up dev "$IFACE"
+}
+
+# /etc/resolv.conf is a bind mount inside containers, so it must be
+# overwritten in place (mv/rename fails with EBUSY).
+set_dns() {
+    [ -n "$DNS" ] || return 0
+    echo "[#] setting DNS:$DNS" >&2
+    [ -f "$RESOLV_BAK" ] || cp "$RESOLV" "$RESOLV_BAK"
+    {
+        for d in $DNS; do echo "nameserver $d"; done
+        [ -z "$DNS_SEARCH" ] || echo "search$DNS_SEARCH"
+    } >"$RESOLV"
+    HAVE_DNS=1
+}
+
+unset_dns() {
+    [ -f "$RESOLV_BAK" ] || return 0
+    echo "[#] restoring DNS" >&2
+    cat "$RESOLV_BAK" >"$RESOLV"
+    rm -f "$RESOLV_BAK"
+}
+
+# $1 = iptables|ip6tables, $2 = -I|-D. Drops packets that arrive on another
+# interface but are addressed to the tunnel's own IP, and keeps the fwmark on
+# replies to UDP packets received on a marked socket.
+fw_restore() {
+    p=-4
+    [ "$1" != ip6tables ] || p=-6
+    {
+        echo '*raw'
+        ip -o "$p" addr show dev "$IFACE" |
+            sed -n 's/.*inet6\{0,1\} \([0-9a-f:.]*\)\/[0-9]*.*/\1/p' |
+            while read -r a; do
+                echo "$2 PREROUTING ! -i $IFACE -d $a -m addrtype ! --src-type LOCAL -j DROP"
+            done
+        echo COMMIT
+        echo '*mangle'
+        echo "$2 POSTROUTING -m mark --mark $FWMARK -p udp -j CONNMARK --save-mark"
+        echo "$2 PREROUTING -p udp -j CONNMARK --restore-mark"
+        echo COMMIT
+    } | "$1-restore" -n
+}
+
+# Routes everything through the tunnel without touching the main table: all
+# traffic that does not carry the interface's fwmark uses a dedicated table.
+add_default() {
+    fw=$(wg show "$IFACE" fwmark)
+    if [ -n "$fw" ] && [ "$fw" != off ]; then
+        FWMARK=$((fw))
+    else
+        FWMARK=51820
+        while [ -n "$(ip -4 route show table "$FWMARK" 2>/dev/null)" ] ||
+            [ -n "$(ip -6 route show table "$FWMARK" 2>/dev/null)" ]; do
+            FWMARK=$((FWMARK + 1))
+        done
+        cmd wg set "$IFACE" fwmark "$FWMARK"
+    fi
+    p=-4 ipt=iptables
+    case $1 in *:*) p=-6 ipt=ip6tables ;; esac
+    cmd ip "$p" rule add not fwmark "$FWMARK" table "$FWMARK"
+    cmd ip "$p" rule add table main suppress_prefixlength 0
+    cmd ip "$p" route add "$1" dev "$IFACE" table "$FWMARK"
+    RULE_PROTOS="$RULE_PROTOS $p"
+    if [ "$p" = -4 ] && [ "$(sysctl -n net.ipv4.conf.all.src_valid_mark)" -ne 1 ]; then
+        cmd sysctl -q net.ipv4.conf.all.src_valid_mark=1
+    fi
+    echo "[#] $ipt-restore -n (fwmark $FWMARK)" >&2
+    fw_restore "$ipt" -I
+    FW_PROTOS="$FW_PROTOS $ipt"
+}
+
+add_route() {
+    p=-4
+    case $1 in *:*) p=-6 ;; esac
+    [ "$TABLE" != off ] || return 0
+    if [ -n "$TABLE" ] && [ "$TABLE" != auto ]; then
+        cmd ip "$p" route add "$1" dev "$IFACE" table "$TABLE"
+        return
+    fi
+    case $1 in
+        */0) add_default "$1" ;;
+        *)
+            [ -z "$(ip "$p" route show dev "$IFACE" match "$1" 2>/dev/null)" ] ||
+                return 0
+            cmd ip "$p" route add "$1" dev "$IFACE"
+            ;;
+    esac
+}
+
+# Best effort: also used to clean up after a partially failed `up`.
+teardown() {
+    set +e
+    [ "$HAVE_DNS" -eq 0 ] || unset_dns
+    for ipt in $FW_PROTOS; do
+        echo "[#] $ipt-restore -n (delete rules)" >&2
+        fw_restore "$ipt" -D
+    done
+    for p in $RULE_PROTOS; do
+        cmd ip "$p" rule delete not fwmark "$FWMARK" table "$FWMARK"
+        cmd ip "$p" rule delete table main suppress_prefixlength 0
+    done
+    cmd ip link delete dev "$IFACE"
+}
+
+up() {
+    if ip link show dev "$IFACE" >/dev/null 2>&1; then
+        die "'$IFACE' already exists"
+    fi
+    cmd ip link add dev "$IFACE" type wireguard
+    trap teardown EXIT
+    run_hooks "$PRE_UP"
+    conf=$(awk -v mode=conf "$PARSE_AWK" "$CONF")
+    printf '%s\n' "$conf" | cmd wg addconf "$IFACE" /dev/stdin
+    for a in $ADDRESSES; do
+        p=-4
+        case $a in *:*) p=-6 ;; esac
+        cmd ip "$p" address add "$a" dev "$IFACE"
+    done
+    set_mtu_up
+    set_dns
+    # Most specific prefixes first.
+    routes=$(wg show "$IFACE" allowed-ips | awk '
+        { for (i = 2; i <= NF; i++) if ($i ~ /^[0-9a-z:.]+\/[0-9]+$/) { split($i, a, "/"); print a[2], $i } }' |
+        sort -rn | cut -d ' ' -f 2)
+    for r in $routes; do add_route "$r"; done
+    run_hooks "$POST_UP"
+    trap - EXIT
+}
+
+down() {
+    run_hooks "$PRE_DOWN" || true
+    teardown
+    run_hooks "$POST_DOWN" || true
+}
 
 # Re-apply the configured Endpoint for peers without a recent handshake, so
 # DNS names (e.g. DDNS) are resolved again after the remote IP changes.
@@ -31,7 +301,8 @@ reresolve() {
     done
 }
 
-wg-quick up "$IFACE"
+load_config
+up
 
 if [ "$INTERVAL" -gt 0 ]; then
     reresolve &
@@ -46,7 +317,7 @@ sleep infinity &
 sleep_pid=$!
 cleanup() {
     kill "$sleep_pid" 2>/dev/null || true
-    wg-quick down "$IFACE" || true
+    down || true
     exit 0
 }
 trap cleanup TERM INT

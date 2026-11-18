@@ -3,8 +3,8 @@ services:
     image: ghcr.io/kalex3/wg:latest
     restart: unless-stopped
     init: true
-    # Not read-only: with a `DNS =` line in the config, wg-quick (via our
-    # resolvconf shim) has to write /etc/resolv.conf, which Podman mounts ro
+    # Not read-only: with a `DNS =` line in the config, the entrypoint has to
+    # write /etc/resolv.conf, which Podman mounts ro
     # on read-only containers. If your config has no DNS =, you can enable:
     # read_only: true
     tmpfs:
@@ -16,7 +16,7 @@ services:
     security_opt:
       - no-new-privileges:true
     sysctls:
-      # Only used by wg-quick for full-tunnel configs (AllowedIPs = 0.0.0.0/0).
+      # Only used by the entrypoint for full-tunnel configs (AllowedIPs = 0.0.0.0/0).
       - net.ipv4.conf.all.src_valid_mark=1
     pids_limit: 128
     mem_limit: 128m
