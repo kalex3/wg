@@ -11,10 +11,12 @@
 #   WG_INTERFACE            interface / config name (default: wg0)
 #   WG_RERESOLVE_INTERVAL   seconds between endpoint re-resolution checks
 #                           for stale peers, 0 disables (default: 30)
+#   WG_KILLSWITCH           true rejects traffic that would bypass a full
+#                           tunnel (default: false)
 set -eu
 
 IFACE="${WG_INTERFACE:-wg0}"
-CONF="/etc/wireguard/$IFACE.conf"
+CONF="/etc/$IFACE.conf"
 INTERVAL="${WG_RERESOLVE_INTERVAL:-30}"
 RESOLV=/etc/resolv.conf
 RESOLV_BAK=/run/resolv.conf.bak
@@ -24,7 +26,8 @@ NL='
 
 ADDRESSES='' DNS='' DNS_SEARCH='' MTU='' TABLE=''
 PRE_UP='' POST_UP='' PRE_DOWN='' POST_DOWN=''
-HAVE_DNS=0 FW_PROTOS='' RULE_PROTOS='' FWMARK=''
+HAVE_DNS=0 FW_PROTOS='' RULE_PROTOS='' FWMARK='' INMARK=''
+KILLSWITCH_INSTALLED=0
 
 die() {
     echo "entrypoint: $*" >&2
@@ -41,6 +44,13 @@ case $IFACE in
 esac
 [ "${#IFACE}" -le 15 ] || die "WG_INTERFACE '$IFACE' is longer than 15 characters"
 [ -r "$CONF" ] || die "cannot read $CONF"
+
+ks=$(printf '%s' "${WG_KILLSWITCH:-}" | tr '[:upper:]' '[:lower:]')
+case $ks in
+    '' | 0 | false | no | off) KILLSWITCH=0 ;;
+    1 | true | yes | on) KILLSWITCH=1 ;;
+    *) die "WG_KILLSWITCH must be true or false, not '$WG_KILLSWITCH'" ;;
+esac
 
 # mode=set:  print "key<TAB>value" for the wg-quick-only keys.
 # mode=conf: print the rest, which is what `wg addconf` understands.
@@ -171,7 +181,11 @@ unset_dns() {
 
 # $1 = iptables|ip6tables, $2 = -I|-D. Drops packets that arrive on another
 # interface but are addressed to the tunnel's own IP, and keeps the fwmark on
-# replies to UDP packets received on a marked socket.
+# replies to UDP packets received on a marked socket. With INMARK set, also
+# tags connections that arrive on a non-tunnel interface so that their replies
+# can be routed back out the way they came (see add_default). The masks keep
+# CONNMARK from touching any other mark bit, and wg's own packets (exactly
+# FWMARK) are skipped so they stay recognisable to kill-switch rules.
 fw_restore() {
     p=-4
     [ "$1" != ip6tables ] || p=-6
@@ -186,12 +200,20 @@ fw_restore() {
         echo '*mangle'
         echo "$2 POSTROUTING -m mark --mark $FWMARK -p udp -j CONNMARK --save-mark"
         echo "$2 PREROUTING -p udp -j CONNMARK --restore-mark"
+        if [ -n "$INMARK" ]; then
+            echo "$2 OUTPUT -m mark ! --mark $FWMARK -j CONNMARK --restore-mark --nfmask $INMARK --ctmask $INMARK"
+            echo "$2 PREROUTING ! -i $IFACE -j CONNMARK --restore-mark --nfmask $INMARK --ctmask $INMARK"
+            echo "$2 PREROUTING ! -i $IFACE -m conntrack --ctstate NEW -j CONNMARK --set-xmark $INMARK/$INMARK"
+        fi
         echo COMMIT
     } | "$1-restore" -n
 }
 
 # Routes everything through the tunnel without touching the main table: all
 # traffic that does not carry the interface's fwmark uses a dedicated table.
+# Replies to connections that arrived on another interface (e.g. published
+# ports) would be sent into the tunnel too, so those are tagged with a second
+# mark bit, disjoint from the fwmark, and looked up in the main table instead.
 add_default() {
     fw=$(wg show "$IFACE" fwmark)
     if [ -n "$fw" ] && [ "$fw" != off ]; then
@@ -204,10 +226,22 @@ add_default() {
         done
         cmd wg set "$IFACE" fwmark "$FWMARK"
     fi
+    INMARK=65536
+    while [ $((FWMARK & INMARK)) -ne 0 ] && [ "$INMARK" -lt 2147483648 ]; do
+        INMARK=$((INMARK * 2))
+    done
+    if [ $((FWMARK & INMARK)) -ne 0 ]; then
+        echo "entrypoint: no free mark bit next to fwmark $FWMARK, replies to inbound connections will use the tunnel" >&2
+        INMARK=''
+    fi
     p=-4 ipt=iptables
     case $1 in *:*) p=-6 ipt=ip6tables ;; esac
     cmd ip "$p" rule add not fwmark "$FWMARK" table "$FWMARK"
     cmd ip "$p" rule add table main suppress_prefixlength 0
+    # Added last so that it gets the lowest preference, i.e. is looked up first.
+    if [ -n "$INMARK" ]; then
+        cmd ip "$p" rule add fwmark "$INMARK/$INMARK" lookup main
+    fi
     cmd ip "$p" route add "$1" dev "$IFACE" table "$FWMARK"
     RULE_PROTOS="$RULE_PROTOS $p"
     if [ "$p" = -4 ] && [ "$(sysctl -n net.ipv4.conf.all.src_valid_mark)" -ne 1 ]; then
@@ -236,9 +270,47 @@ add_route() {
     esac
 }
 
+# Reject anything that would leave on an interface other than the tunnel,
+# except replies to connections someone else opened (published ports,
+# neighbor containers). Only families that got a full-tunnel route have a
+# fwmark, so a split tunnel is left alone.
+install_killswitch() {
+    [ "$KILLSWITCH" -eq 1 ] || return 0
+    if [ -z "$FWMARK" ]; then
+        echo "entrypoint: WG_KILLSWITCH is set but no full-tunnel route was installed, so the kill switch was not added" >&2
+        return 0
+    fi
+    KILLSWITCH_INSTALLED=1
+    done_ipt=''
+    for ipt in $FW_PROTOS; do
+        case " $done_ipt " in
+            *" $ipt "*) continue ;;
+        esac
+        done_ipt="$done_ipt $ipt"
+        # REJECT first, then the reply ACCEPT, so -I leaves ACCEPT above it.
+        cmd "$ipt" -I OUTPUT ! -o "$IFACE" -m mark ! --mark "$FWMARK" -m addrtype ! --dst-type LOCAL -j REJECT
+        cmd "$ipt" -I OUTPUT -m conntrack --ctdir REPLY -j ACCEPT
+    done
+}
+
+remove_killswitch() {
+    [ "$KILLSWITCH_INSTALLED" -eq 1 ] || return 0
+    done_ipt=''
+    for ipt in $FW_PROTOS; do
+        case " $done_ipt " in
+            *" $ipt "*) continue ;;
+        esac
+        done_ipt="$done_ipt $ipt"
+        echo "[#] $ipt -D OUTPUT (kill switch)" >&2
+        "$ipt" -D OUTPUT -m conntrack --ctdir REPLY -j ACCEPT
+        "$ipt" -D OUTPUT ! -o "$IFACE" -m mark ! --mark "$FWMARK" -m addrtype ! --dst-type LOCAL -j REJECT
+    done
+}
+
 # Best effort: also used to clean up after a partially failed `up`.
 teardown() {
     set +e
+    remove_killswitch
     [ "$HAVE_DNS" -eq 0 ] || unset_dns
     for ipt in $FW_PROTOS; do
         echo "[#] $ipt-restore -n (delete rules)" >&2
@@ -247,6 +319,9 @@ teardown() {
     for p in $RULE_PROTOS; do
         cmd ip "$p" rule delete not fwmark "$FWMARK" table "$FWMARK"
         cmd ip "$p" rule delete table main suppress_prefixlength 0
+        if [ -n "$INMARK" ]; then
+            cmd ip "$p" rule delete fwmark "$INMARK/$INMARK" lookup main
+        fi
     done
     cmd ip link delete dev "$IFACE"
 }
@@ -272,6 +347,7 @@ up() {
         { for (i = 2; i <= NF; i++) if ($i ~ /^[0-9a-z:.]+\/[0-9]+$/) { split($i, a, "/"); print a[2], $i } }' |
         sort -rn | cut -d ' ' -f 2)
     for r in $routes; do add_route "$r"; done
+    install_killswitch
     run_hooks "$POST_UP"
     trap - EXIT
 }
@@ -282,21 +358,58 @@ down() {
     run_hooks "$POST_DOWN" || true
 }
 
-# Re-apply the configured Endpoint for peers without a recent handshake, so
-# DNS names (e.g. DDNS) are resolved again after the remote IP changes.
+# Host part of an Endpoint (1.2.3.4:port, [v6]:port or name:port).
+endpoint_host() {
+    case $1 in
+        \[*:*) h=${1#\[}; h=${h%\]:*} ;;
+        \[*\]) h=${1#\[}; h=${h%\]} ;;
+        *:*) h=${1%:*} ;;
+        *) h=$1 ;;
+    esac
+    printf '%s' "$h"
+}
+
+endpoint_is_ip() {
+    case $1 in
+        '' | *[!0-9.]*) ;;
+        *) return 0 ;;
+    esac
+    case $1 in
+        *:*)
+            case $1 in
+                *[!0-9A-Fa-f:]*) return 1 ;;
+                *) return 0 ;;
+            esac
+            ;;
+    esac
+    return 1
+}
+
+# Re-apply a configured hostname Endpoint when its handshake is stale, so a
+# DNS name (e.g. DDNS) is resolved again. Literal IP endpoints are left alone,
+# so a peer that roamed keeps the address it moved to.
 reresolve() {
     while sleep "$INTERVAL"; do
         wg show "$IFACE" latest-handshakes 2>/dev/null | while read -r pk hs; do
             [ $(( $(date +%s) - hs )) -gt 135 ] || continue
             ep=$(awk -v pk="$pk" '
-                { k=$0; sub(/[ \t]*=.*/, "", k)
-                  v=$0; sub(/^[^=]*=[ \t]*/, "", v); sub(/[ \t\r]+$/, "", v) }
-                k == "PublicKey" { cur = v }
-                k == "Endpoint" && cur == pk { print v; exit }
+                function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+                {
+                    s = $0
+                    sub(/#.*/, "", s)
+                    eq = index(s, "=")
+                    if (!eq) next
+                    k = tolower(trim(substr(s, 1, eq - 1)))
+                    v = trim(substr(s, eq + 1))
+                    if (k == "publickey") cur = v
+                    if (k == "endpoint" && cur == pk) { print v; exit }
+                }
             ' "$CONF")
-            if [ -n "$ep" ]; then
-                wg set "$IFACE" peer "$pk" endpoint "$ep" || true
+            [ -n "$ep" ] || continue
+            if endpoint_is_ip "$(endpoint_host "$ep")"; then
+                continue
             fi
+            wg set "$IFACE" peer "$pk" endpoint "$ep" || true
         done
     done
 }
@@ -304,21 +417,35 @@ reresolve() {
 load_config
 up
 
+child_pid='' reresolve_pid=''
+
+stop_helpers() {
+    [ -z "$reresolve_pid" ] || kill "$reresolve_pid" 2>/dev/null || true
+    [ -z "$child_pid" ] || kill "$child_pid" 2>/dev/null || true
+}
+
+# Stay the main process even when a command was given, so a stop signal still
+# runs `down`.
+finish() {
+    status=$1
+    trap - TERM INT
+    stop_helpers
+    down || true
+    exit "$status"
+}
+trap 'finish 0' TERM INT
+
 if [ "$INTERVAL" -gt 0 ]; then
     reresolve &
+    reresolve_pid=$!
 fi
 
 if [ "$#" -gt 0 ]; then
-    exec "$@"
+    "$@" &
+else
+    sleep infinity &
 fi
-
-# No command given: idle, but tear the tunnel down cleanly on stop.
-sleep infinity &
-sleep_pid=$!
-cleanup() {
-    kill "$sleep_pid" 2>/dev/null || true
-    down || true
-    exit 0
-}
-trap cleanup TERM INT
-wait "$sleep_pid"
+child_pid=$!
+status=0
+wait "$child_pid" || status=$?
+finish "$status"

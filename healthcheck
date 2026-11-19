@@ -1,11 +1,61 @@
 #!/bin/sh
-# Healthy if at least one peer had a handshake within WG_HANDSHAKE_MAX_AGE
-# seconds (default 180, i.e. WireGuard's reject-after-time window).
+# Healthy when the interface is up. A full tunnel (an AllowedIP of 0.0.0.0/0
+# or ::/0, and Table is not off) must also have the firewall rules installed
+# for that family.
 set -eu
 
 IFACE="${WG_INTERFACE:-wg0}"
-MAX_AGE="${WG_HANDSHAKE_MAX_AGE:-180}"
+CONF="/etc/$IFACE.conf"
 
-wg show "$IFACE" latest-handshakes 2>/dev/null |
-    awk -v now="$(date +%s)" -v max="$MAX_AGE" \
-        '$2 > 0 && now - $2 >= 0 && now - $2 < max { ok = 1 } END { exit !ok }'
+ip -o link show dev "$IFACE" 2>/dev/null | grep -q '<[^>]*UP' || exit 1
+
+allowed=$(wg show "$IFACE" allowed-ips 2>/dev/null || true)
+v4=0
+v6=0
+printf '%s\n' "$allowed" | grep -Fq '0.0.0.0/0' && v4=1 || true
+printf '%s\n' "$allowed" | grep -Fq '::/0' && v6=1 || true
+[ "$v4" -eq 1 ] || [ "$v6" -eq 1 ] || exit 0
+
+# shellcheck disable=SC2016 # awk program, nothing should expand
+table=$(awk '
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+{
+    s = $0
+    sub(/#.*/, "", s)
+    if (s ~ /^\[/) { iface = tolower(s) ~ /^\[interface\]/; next }
+    if (!iface) next
+    eq = index(s, "=")
+    if (!eq) next
+    k = tolower(trim(substr(s, 1, eq - 1)))
+    if (k == "table") { print tolower(trim(substr(s, eq + 1))); exit }
+}
+' "$CONF")
+[ "$table" != off ] || exit 0
+
+# $1 is iptables or ip6tables. The raw rule is the anti-spoof drop; the
+# mangle rule is the fwmark saved onto answered UDP.
+fw_ok() {
+    "$1" -t raw -S PREROUTING 2>/dev/null | grep -q "! -i $IFACE" || return 1
+    "$1" -t raw -S PREROUTING 2>/dev/null | grep -q ' -j DROP' || return 1
+    "$1" -t mangle -S 2>/dev/null | grep -q CONNMARK
+}
+
+[ "$v4" -eq 0 ] || fw_ok iptables
+[ "$v6" -eq 0 ] || fw_ok ip6tables
+
+# Same switch as the entrypoint. When it is on, the OUTPUT rules are part of
+# the firewall a full tunnel is expected to have.
+ks=$(printf '%s' "${WG_KILLSWITCH:-}" | tr '[:upper:]' '[:lower:]')
+case $ks in
+    '' | 0 | false | no | off) ;;
+    1 | true | yes | on)
+        ks_ok() {
+            "$1" -S OUTPUT 2>/dev/null | grep -q 'ctdir REPLY' || return 1
+            "$1" -S OUTPUT 2>/dev/null | grep -q "! -o $IFACE" || return 1
+            "$1" -S OUTPUT 2>/dev/null | grep -q ' -j REJECT'
+        }
+        [ "$v4" -eq 0 ] || ks_ok iptables
+        [ "$v6" -eq 0 ] || ks_ok ip6tables
+        ;;
+    *) exit 1 ;;
+esac

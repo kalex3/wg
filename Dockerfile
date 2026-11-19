@@ -1,4 +1,4 @@
-FROM alpine:3.24 AS rootfs
+FROM alpine:3.24.4 AS rootfs
 
 # Install into an empty root so the final image has no package manager, no
 # OpenSSL and no CA bundle. The package database stays in /lib/apk so image
@@ -15,7 +15,7 @@ FROM scratch
 COPY --from=rootfs /rootfs/ /
 COPY --chmod=755 entrypoint healthcheck /usr/local/bin/
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD ["/usr/local/bin/healthcheck"]
+HEALTHCHECK CMD ["/usr/local/bin/healthcheck"]
 
 STOPSIGNAL SIGTERM
 

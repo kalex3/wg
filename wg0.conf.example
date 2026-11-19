@@ -21,7 +21,7 @@ PersistentKeepalive = 25
 
 # To force ALL traffic of containers using `network_mode: service:wg` through
 # the tunnel, use a full-tunnel peer instead (and drop the narrower ones):
-#   AllowedIPs = 0.0.0.0/0
-# Optional kill switch (block anything that would bypass the tunnel):
-#   PostUp   = iptables -I OUTPUT ! -o %i -m mark ! --mark $(wg show %i fwmark) -m addrtype ! --dst-type LOCAL -j REJECT
-#   PreDown  = iptables -D OUTPUT ! -o %i -m mark ! --mark $(wg show %i fwmark) -m addrtype ! --dst-type LOCAL -j REJECT
+#   AllowedIPs = 0.0.0.0/0, ::/0
+# Then set WG_KILLSWITCH=true (see compose.yml) to reject traffic that would
+# bypass the tunnel. Replies to connections opened by someone else are still
+# allowed. A split tunnel like the peers above does not get a kill switch.
