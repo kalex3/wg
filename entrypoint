@@ -137,6 +137,7 @@ route_mtu() {
 
 # Without MTU=, use the smallest MTU on the paths to the peers' endpoints
 # (falling back to the default route) minus 80 bytes of WireGuard overhead.
+# wg-quick uses the same formula and substitutes 1500 when it finds nothing.
 set_mtu_up() {
     if [ -n "$MTU" ]; then
         cmd ip link set mtu "$MTU" up dev "$IFACE"
@@ -155,7 +156,7 @@ set_mtu_up() {
         m=$(route_mtu "$(ip route show default 2>/dev/null | head -n 1)")
         if [ -n "$m" ] && [ "$m" -lt "$best" ]; then best=$m; fi
     fi
-    if [ "$best" -le 0 ] || [ "$best" -eq 2147483647 ]; then best=1500; fi
+    if [ "$best" -le 0 ] || [ "$best" -gt 1500 ]; then best=1500; fi
     cmd ip link set mtu $((best - 80)) up dev "$IFACE"
 }
 

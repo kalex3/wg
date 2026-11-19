@@ -13,6 +13,10 @@ services:
       - NET_ADMIN
     security_opt:
       - no-new-privileges:true
+    # Compose defaults this to 0. Rootless Podman then fails every healthcheck
+    # exec on crun 1.31, because the systemd unit that runs it cannot lower
+    # its own oom score to 0. 200 is the score Podman already applies.
+    oom_score_adj: 200
     env_file: wg.env
     sysctls:
       # Used when a full tunnel marks packets. Harmless for a split tunnel:
