@@ -1,0 +1,2 @@
+# Copied to resolv.conf and mounted at /etc/resolv.conf.
+# The entrypoint overwrites it from DNS= in the WireGuard config.

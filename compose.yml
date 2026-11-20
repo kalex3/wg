@@ -2,9 +2,9 @@ services:
   wg:
     image: ghcr.io/kalex3/wg:latest
     restart: unless-stopped
-    # If your config has no DNS =, you can enable:
     # read_only: true
-    # /run has to stay writable for the DNS backup and the iptables lock:
+    # resolv.conf is its own writable mount. /run still has to be writable
+    # for the DNS backup and the iptables lock:
     # tmpfs:
     #   - /run
     cap_drop:
@@ -24,6 +24,9 @@ services:
       - net.ipv4.conf.all.src_valid_mark=1
     volumes:
       - ./${WG_INTERFACE:-wg0}.conf:/etc/${WG_INTERFACE:-wg0}.conf:ro
+      # Same file in every container that joins this network namespace.
+      # Podman would share its own resolv.conf; Docker and nerdctl would not.
+      - ./resolv.conf:/etc/resolv.conf
     # Defined here as well, because Podman drops the image's HEALTHCHECK for
     # OCI-format images (e.g. when pulled from GHCR).
     healthcheck:
@@ -43,4 +46,6 @@ services:
         # Recreate the client when wg restarts, otherwise it keeps a stale netns.
         restart: true
     restart: unless-stopped
+    volumes:
+      - ./resolv.conf:/etc/resolv.conf:ro
     command: ["sleep", "infinity"]

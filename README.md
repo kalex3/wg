@@ -6,11 +6,12 @@ Small WireGuard container, built from Alpine with no package manager, that other
 
 ```sh
 cp wg0.conf.example wg0.conf   # fill in keys, peers, endpoints
+cp resolv.conf.example resolv.conf
 chmod 600 wg0.conf             # entrypoint settings live in wg.env
 docker compose up -d --build
 ```
 
-`compose.yml` starts `wg` plus an example `client` (plain Alpine) with `network_mode: service:wg`. Replace `client` with your own service and publish ports on `wg`, not on the client.
+`compose.yml` starts `wg` plus an example `client` (plain Alpine) with `network_mode: service:wg`. Replace `client` with your own service and publish ports on `wg`, not on the client. Mount `./resolv.conf` read-only at `/etc/resolv.conf` in that service too. The entrypoint fills the file from `DNS =`, and a read-only mount keeps a root shell in the client from pointing the other containers at a different resolver.
 
 - The host needs the `wireguard` kernel module (included by default on all major distros)
 - Traffic is only forced through the tunnel for destinations covered by the peers' `AllowedIPs`. Use `AllowedIPs = 0.0.0.0/0` to force everything, and `WG_KILLSWITCH=true` to reject traffic that would otherwise bypass that tunnel.
@@ -29,6 +30,7 @@ wgcf register --accept-tos            # creates wgcf-account.toml (keep it priva
 wgcf generate -p wg0.conf             # writes the WireGuard profile
 sed -i '/^Endpoint/a PersistentKeepalive = 25' wg0.conf   # keeps an idle tunnel from expiring its NAT mapping
 chmod 600 wg0.conf
+cp resolv.conf.example resolv.conf
 docker compose up -d --build
 
 # the client container now exits through WARP:
